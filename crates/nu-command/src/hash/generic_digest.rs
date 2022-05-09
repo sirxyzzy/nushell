@@ -1,8 +1,9 @@
 use nu_engine::CallExt;
 use nu_protocol::ast::{Call, CellPath};
 use nu_protocol::engine::{Command, EngineState, Stack};
-use nu_protocol::{Example, PipelineData, ShellError, Signature, SyntaxShape, Value};
+use nu_protocol::{Example, PipelineData, ShellError, Signature, SyntaxShape, Value, Spanned, IntoPipelineData};
 use std::marker::PhantomData;
+use std::path::PathBuf;
 
 pub trait HashDigest: digest::Digest + Clone {
     fn name() -> &'static str;
@@ -36,11 +37,18 @@ where
     }
 
     fn signature(&self) -> Signature {
-        Signature::build(self.name()).rest(
-            "rest",
-            SyntaxShape::CellPath,
-            format!("optionally {} hash data by cell path", D::name()),
-        )
+        Signature::build(self.name())
+            .named(
+                "file",
+                SyntaxShape::Filepath,
+                "a file to read from (rather than the pipeline)",
+                Some('f')
+            )
+            .rest(
+                "rest",
+                SyntaxShape::CellPath,
+                format!("optionally {} hash data by cell path", D::name()),
+            )
     }
 
     fn usage(&self) -> &str {
@@ -60,24 +68,35 @@ where
     ) -> Result<nu_protocol::PipelineData, nu_protocol::ShellError> {
         let cell_paths: Vec<CellPath> = call.rest(engine_state, stack, 0)?;
 
-        input.map(
-            move |v| {
-                if cell_paths.is_empty() {
-                    action::<D>(&v)
-                } else {
-                    let mut v = v;
-                    for path in &cell_paths {
-                        let ret = v
-                            .update_cell_path(&path.members, Box::new(move |old| action::<D>(old)));
-                        if let Err(error) = ret {
-                            return Value::Error { error };
+        let file: Option<Spanned<PathBuf>> = call.get_flag(engine_state, stack, "file")?;
+
+        if let Some(path) = file {
+            // Read from file
+            let bytes = std::fs::read(path.item)?;
+            let val = format!("{:x}", D::digest(bytes));
+            Ok(Value::String { val, span: path.span }.into_pipeline_data())
+
+        } else {
+            // Read from pipeline
+            input.map(
+                move |v| {
+                    if cell_paths.is_empty() {
+                        action::<D>(&v)
+                    } else {
+                        let mut v = v;
+                        for path in &cell_paths {
+                            let ret = v
+                                .update_cell_path(&path.members, Box::new(move |old| action::<D>(old)));
+                            if let Err(error) = ret {
+                                return Value::Error { error };
+                            }
                         }
+                        v
                     }
-                    v
-                }
-            },
-            engine_state.ctrlc.clone(),
-        )
+                },
+                engine_state.ctrlc.clone(),
+            )
+        }
     }
 }
 
